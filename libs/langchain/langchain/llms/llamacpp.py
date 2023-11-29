@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
-from langchain_core.outputs import GenerationChunk
-from langchain_core.pydantic_v1 import Field, root_validator
-from langchain_core.utils import get_pydantic_field_names
-from langchain_core.utils.utils import build_extra_kwargs
-
-from langchain.callbacks.manager import CallbackManagerForLLMRun
+from langchain.callbacks.manager import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain.llms.base import LLM
+from langchain.pydantic_v1 import Field, root_validator
+from langchain.schema.output import GenerationChunk
+from langchain.utils import get_pydantic_field_names
+from langchain.utils.utils import build_extra_kwargs
 
 if TYPE_CHECKING:
     from llama_cpp import LlamaGrammar
@@ -303,6 +316,36 @@ class LlamaCpp(LLM):
             result = self.client(prompt=prompt, **params)
             return result["choices"][0]["text"]
 
+    async def _acall(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Async call the Llama model and return the output.
+
+        Args:
+            prompt: The prompt to use for generation.
+            stop: A list of strings to stop generation when encountered.
+
+        Returns:
+            The generated text.
+        """
+        if self.streaming:
+            combined_text_output = ""
+            async for chunk in self._astream(prompt, stop, run_manager, **kwargs):
+                combined_text_output += chunk.text
+            return combined_text_output
+        else:
+            params = self._get_parameters(stop)
+            params = {**params, **kwargs}
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, partial(self.client, prompt=prompt, **params)
+            )
+            return result["choices"][0]["text"]
+
     def _stream(
         self,
         prompt: str,
@@ -351,6 +394,47 @@ class LlamaCpp(LLM):
             yield chunk
             if run_manager:
                 run_manager.on_llm_new_token(
+                    token=chunk.text, verbose=self.verbose, log_probs=logprobs
+                )
+
+    async def _astream(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[GenerationChunk]:
+        """Yields results objects as they are generated in real time.
+
+        It also calls the callback manager's on_llm_new_token event with
+        similar parameters to the OpenAI LLM class method of the same name.
+
+        Args:
+            prompt: The prompts to pass into the model.
+            stop: Optional list of stop words to use when generating.
+
+        Returns:
+            An async generator representing the stream of tokens being generated.
+        """
+        params = {**self._get_parameters(stop), **kwargs}
+
+        loop = asyncio.get_running_loop()
+        iterator = await loop.run_in_executor(
+            None, partial(self.client, prompt=prompt, stream=True, **params)
+        )
+        while True:
+            part: Any = await loop.run_in_executor(None, next, iterator, None)
+            if part is None:
+                break
+
+            logprobs = part["choices"][0].get("logprobs", None)
+            chunk = GenerationChunk(
+                text=part["choices"][0]["text"],
+                generation_info={"logprobs": logprobs},
+            )
+            yield chunk
+            if run_manager:
+                await run_manager.on_llm_new_token(
                     token=chunk.text, verbose=self.verbose, log_probs=logprobs
                 )
 
